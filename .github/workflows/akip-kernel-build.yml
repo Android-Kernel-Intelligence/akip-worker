@@ -100,12 +100,20 @@ jobs:
           KERNEL_REPO=$(echo "$MANIFEST_JSON"    | python3 -c "import sys,json; print(json.load(sys.stdin).get('kernel_repo',''))")
           KERNEL_BRANCH=$(echo "$MANIFEST_JSON"  | python3 -c "import sys,json; print(json.load(sys.stdin).get('kernel_branch','main'))")
           DEFCONFIG=$(echo "$MANIFEST_JSON"      | python3 -c "import sys,json; print(json.load(sys.stdin).get('defconfig','defconfig'))")
+          REPO_OWNER=$(echo "$MANIFEST_JSON"     | python3 -c "import sys,json; print(json.load(sys.stdin).get('repo_owner',''))")
+          REPO_NAME=$(echo "$MANIFEST_JSON"      | python3 -c "import sys,json; print(json.load(sys.stdin).get('repo_name',''))")
+          COMMIT_HASH=$(echo "$MANIFEST_JSON"    | python3 -c "import sys,json; print(json.load(sys.stdin).get('commit_hash',''))")
+          COMMIT_SHORT_HASH=$(echo "$MANIFEST_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('commit_short_hash',''))")
 
           echo "kernel_version=${KERNEL_VERSION}" >> "$GITHUB_OUTPUT"
           echo "arch=${ARCH}"                     >> "$GITHUB_OUTPUT"
           echo "kernel_repo=${KERNEL_REPO}"       >> "$GITHUB_OUTPUT"
           echo "kernel_branch=${KERNEL_BRANCH}"   >> "$GITHUB_OUTPUT"
           echo "defconfig=${DEFCONFIG}"           >> "$GITHUB_OUTPUT"
+          echo "repo_owner=${REPO_OWNER}"         >> "$GITHUB_OUTPUT"
+          echo "repo_name=${REPO_NAME}"           >> "$GITHUB_OUTPUT"
+          echo "commit_hash=${COMMIT_HASH}"       >> "$GITHUB_OUTPUT"
+          echo "commit_short_hash=${COMMIT_SHORT_HASH}" >> "$GITHUB_OUTPUT"
 
           echo "Manifest fetched: kernel=${KERNEL_VERSION} arch=${ARCH}"
           echo "Repo: ${KERNEL_REPO} @ ${KERNEL_BRANCH}"
@@ -136,22 +144,25 @@ jobs:
 
           REPO="${{ steps.fetch.outputs.kernel_repo }}"
           BRANCH="${{ steps.fetch.outputs.kernel_branch }}"
+          COMMIT_HASH="${{ steps.fetch.outputs.commit_hash }}"
 
           if [ -z "$REPO" ]; then
             echo "::error::kernel_repo is empty in manifest"
             exit 1
           fi
 
-          # Try the specified branch, fallback to HEAD
-          git clone \
-            --depth=1 \
-            --branch "${BRANCH}" \
-            "${REPO}" \
-            kernel-src 2>&1 || \
-          git clone \
-            --depth=1 \
-            "${REPO}" \
-            kernel-src 2>&1
+          # Full clone to support arbitrary commit checkout
+          git clone "${REPO}" kernel-src 2>&1
+          
+          if [ -n "${COMMIT_HASH}" ] && [ "${COMMIT_HASH}" != "unknown" ]; then
+            cd kernel-src
+            git checkout "${COMMIT_HASH}" 2>&1
+            cd ..
+          elif [ -n "${BRANCH}" ]; then
+            cd kernel-src
+            git checkout "${BRANCH}" 2>&1
+            cd ..
+          fi
 
           echo "Source lines: $(find kernel-src -name '*.c' | wc -l) C files"
           echo "::endgroup::"
@@ -439,7 +450,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "build/${{ env.MANIFEST_ID }}"
-          name: "AKIP Build — ${{ steps.fetch.outputs.kernel_version }} (${{ env.MANIFEST_ID }})"
+          name: "AKIP Build - ${{ steps.fetch.outputs.repo_owner }}-${{ steps.fetch.outputs.repo_name }}-${{ steps.fetch.outputs.commit_short_hash }}"
           body: |
             ## AKIP Kernel Build
 
