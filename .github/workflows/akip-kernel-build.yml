@@ -434,7 +434,9 @@ jobs:
           echo "::group::Package with AnyKernel3"
           ARCH="${{ steps.fetch.outputs.arch }}"
           KV="${{ steps.fetch.outputs.kernel_version }}"
-          ZIP_NAME="AKIP-${KV}-${MANIFEST_ID:0:8}.zip"
+          RELEASE_TITLE="${{ steps.fetch.outputs.release_name }}"
+          CLEANED_TITLE=$(echo "$RELEASE_TITLE" | sed 's/ - /-/g' | sed 's/ /_/g' | sed 's/[^a-zA-Z0-9_-]//g')
+          ZIP_NAME="${CLEANED_TITLE}.zip"
 
           [ -f "out/arch/${ARCH}/boot/Image.gz" ] && cp "out/arch/${ARCH}/boot/Image.gz" AnyKernel3/Image.gz
           [ -f "out/arch/${ARCH}/boot/Image" ]    && cp "out/arch/${ARCH}/boot/Image"    AnyKernel3/Image
