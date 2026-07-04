@@ -104,6 +104,26 @@ jobs:
           REPO_NAME=$(echo "$MANIFEST_JSON"      | python3 -c "import sys,json; print(json.load(sys.stdin).get('repo_name',''))")
           COMMIT_HASH=$(echo "$MANIFEST_JSON"    | python3 -c "import sys,json; print(json.load(sys.stdin).get('commit_hash',''))")
           COMMIT_SHORT_HASH=$(echo "$MANIFEST_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('commit_short_hash',''))")
+          RELEASE_NAME=$(echo "$MANIFEST_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('release_name',''))")
+          DEVICE_MANUFACTURER=$(echo "$MANIFEST_JSON" | python3 -c "import sys,json; m=json.load(sys.stdin).get('device_info',{}); print(m.get('manufacturer',''))")
+          DEVICE_MODEL=$(echo "$MANIFEST_JSON" | python3 -c "import sys,json; m=json.load(sys.stdin).get('device_info',{}); print(m.get('model',''))")
+          DEVICE_CODENAME=$(echo "$MANIFEST_JSON" | python3 -c "import sys,json; m=json.load(sys.stdin).get('device_info',{}); print(m.get('codename',''))")
+          SUPPORTED_DEVICES=$(echo "$MANIFEST_JSON" | python3 -c "import sys,json; m=json.load(sys.stdin).get('device_info',{}); print(m.get('supported_devices',''))")
+          
+          ROOT_FLAVOR=$(echo "$MANIFEST_JSON" | python3 -c "
+          import sys,json
+          p = json.load(sys.stdin).get('plugin_paths',[])
+          if 'plugins/root/kernelsu' in p: print('KernelSU (KSU)')
+          elif 'plugins/root/ksu-next' in p: print('KernelSU Next (KSU-Next)')
+          elif 'plugins/root/sukisu-ultra' in p: print('SukiSu Ultra')
+          else: print('None')
+          ")
+          
+          SUSFS_STATUS=$(echo "$MANIFEST_JSON" | python3 -c "
+          import sys,json
+          p = json.load(sys.stdin).get('plugin_paths',[])
+          print('Applied' if 'plugins/security/susfs' in p else 'Not Applied')
+          ")
 
           echo "kernel_version=${KERNEL_VERSION}" >> "$GITHUB_OUTPUT"
           echo "arch=${ARCH}"                     >> "$GITHUB_OUTPUT"
@@ -114,6 +134,13 @@ jobs:
           echo "repo_name=${REPO_NAME}"           >> "$GITHUB_OUTPUT"
           echo "commit_hash=${COMMIT_HASH}"       >> "$GITHUB_OUTPUT"
           echo "commit_short_hash=${COMMIT_SHORT_HASH}" >> "$GITHUB_OUTPUT"
+          echo "release_name=${RELEASE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "device_manufacturer=${DEVICE_MANUFACTURER}" >> "$GITHUB_OUTPUT"
+          echo "device_model=${DEVICE_MODEL}" >> "$GITHUB_OUTPUT"
+          echo "device_codename=${DEVICE_CODENAME}" >> "$GITHUB_OUTPUT"
+          echo "supported_devices=${SUPPORTED_DEVICES}" >> "$GITHUB_OUTPUT"
+          echo "root_flavor=${ROOT_FLAVOR}" >> "$GITHUB_OUTPUT"
+          echo "susfs_status=${SUSFS_STATUS}" >> "$GITHUB_OUTPUT"
 
           echo "Manifest fetched: kernel=${KERNEL_VERSION} arch=${ARCH}"
           echo "Repo: ${KERNEL_REPO} @ ${KERNEL_BRANCH}"
@@ -450,15 +477,29 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "build/${{ env.MANIFEST_ID }}"
-          name: "AKIP Build - ${{ steps.fetch.outputs.repo_owner }}-${{ steps.fetch.outputs.repo_name }}-${{ steps.fetch.outputs.commit_short_hash }}"
+          name: "${{ steps.fetch.outputs.release_name }}"
           body: |
-            ## AKIP Kernel Build
+            ## AKIP Kernel Build Details
+
+            ### Kernel Metadata
+            - **Source Repository**: ${{ steps.fetch.outputs.kernel_repo }}
+            - **Git Commit**: `${{ steps.fetch.outputs.commit_hash }}`
+            - **Kernel Version**: `${{ steps.fetch.outputs.kernel_version }}`
+            - **Target Architecture**: `${{ steps.fetch.outputs.arch }}`
+
+            ### Device Information
+            - **Manufacturer**: ${{ steps.fetch.outputs.device_manufacturer }}
+            - **Model**: ${{ steps.fetch.outputs.device_model }}
+            - **Codename**: `${{ steps.fetch.outputs.device_codename }}`
+            - **Supported Devices**: ${{ steps.fetch.outputs.supported_devices }}
+
+            ### Applied Overlay Prefs
+            - **Root Solution**: **${{ steps.fetch.outputs.root_flavor }}**
+            - **SUSFS Anti-Detection**: **${{ steps.fetch.outputs.susfs_status }}**
 
             | Field           | Value |
             |-----------------|-------|
             | **Manifest ID** | `${{ env.MANIFEST_ID }}` |
-            | **Kernel**      | `${{ steps.fetch.outputs.kernel_version }}` |
-            | **Arch**        | `${{ steps.fetch.outputs.arch }}` |
             | **SHA-256**     | `${{ steps.package.outputs.binary_hash }}` |
 
             > Built by [AKIP Platform](https://akip.pages.dev).
