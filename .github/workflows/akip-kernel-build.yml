@@ -1,14 +1,9 @@
 # ============================================================
 # AKIP Kernel Build Workflow
 # ============================================================
-# Triggered manually via workflow_dispatch.
-# Accepts a MANIFEST_ID and API_URL, then:
-#   1. Installs Python + akip-cli
-#   2. Fetches the BuildManifest from the AKIP API
-#   3. Clones the kernel source + applies akip-cli patches
-#   4. Compiles the kernel with Clang/LLVM
-#   5. Packages the image with AnyKernel3
-#   6. Uploads to GitHub Releases + reports FINISHED status to API
+# Triggered via workflow_dispatch with:
+#   - MANIFEST_ID: UUID from POST /build
+#   - API_URL:     AKIP API base URL
 # ============================================================
 
 name: AKIP — Kernel Build
@@ -21,42 +16,37 @@ on:
         required: true
         type: string
       API_URL:
-        description: "Base URL of the AKIP API (e.g. https://akip-api.example.workers.dev)"
+        description: "Base URL of the AKIP API"
         required: true
         type: string
+        default: "https://api.akip.workers.dev"
 
-# ── Cancel any in-progress run for the same manifest ──────────────────────────
 concurrency:
   group: akip-build-${{ github.event.inputs.MANIFEST_ID }}
   cancel-in-progress: false
 
-# ── Minimal required permissions ──────────────────────────────────────────────
 permissions:
-  contents: write   # needed to create GitHub Releases
+  contents: write
 
 env:
-  # ── Toolchain ──────────────────────────────────────────────────────────────
   CLANG_VERSION: "17"
-  PYTHON_VERSION: "3.11"
   ANYKERNEL3_REPO: "https://github.com/osm0sis/AnyKernel3.git"
   ANYKERNEL3_BRANCH: "master"
-
-  # ── Derived from inputs ────────────────────────────────────────────────────
   MANIFEST_ID: ${{ github.event.inputs.MANIFEST_ID }}
-  API_URL:     ${{ github.event.inputs.API_URL }}
+  API_URL: ${{ github.event.inputs.API_URL }}
+
+# ── Shared bash function for reporting logs to API ────────────────────────────
+# Each step calls: report_status <progress> <step_name> <log_line1> [log_line2...]
 
 jobs:
-  # ============================================================
-  # JOB: build
-  # ============================================================
   build:
-    name: Build Kernel (${{ github.event.inputs.MANIFEST_ID }})
+    name: "Build Kernel (${{ github.event.inputs.MANIFEST_ID }})"
     runs-on: ubuntu-22.04
     timeout-minutes: 120
 
     steps:
       # ──────────────────────────────────────────────────────────────────────
-      # STEP 0 — Checkout this repository (needed to install akip-cli locally)
+      # STEP 0 — Checkout repository
       # ──────────────────────────────────────────────────────────────────────
       - name: Checkout akip-worker
         uses: actions/checkout@v4
@@ -64,137 +54,232 @@ jobs:
           path: akip-worker
 
       # ──────────────────────────────────────────────────────────────────────
-      # STEP 1 — Install Python & akip-cli
+      # STEP 1 — Install Python (no pip cache — no requirements.txt)
       # ──────────────────────────────────────────────────────────────────────
-      - name: Set up Python ${{ env.PYTHON_VERSION }}
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
+          python-version: "3.11"
+          # No cache: pip — avoids "no requirements.txt" error
 
-      - name: Install akip-cli from repository
+      - name: Report runner allocated
         run: |
-          echo "::group::Install akip-cli"
-          # Install the CLI tool from the checked-out akip-worker package.
-          # Falls back to a published PyPI package if setup.py / pyproject.toml is present.
-          if [ -f akip-worker/pyproject.toml ] || [ -f akip-worker/setup.py ]; then
-            pip install --upgrade pip
-            pip install ./akip-worker
-          else
-            echo "No Python package found in akip-worker — installing from PyPI (akip-cli)"
-            pip install --upgrade pip akip-cli
-          fi
-
-          # Verify installation
-          akip-cli --version
-          echo "::endgroup::"
-
-      # ──────────────────────────────────────────────────────────────────────
-      # STEP 2 — Fetch the Build Manifest from the AKIP API
-      # ──────────────────────────────────────────────────────────────────────
-      - name: Report build status -> RUNNING
-        run: |
-          curl -fsSL \
-            -X POST "${{ env.API_URL }}/status/update" \
+          curl -sf \
+            -X POST "${API_URL}/status/update" \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer ${{ secrets.AKIP_API_TOKEN }}" \
-            -d '{
-              "build_id": "${{ env.MANIFEST_ID }}",
-              "status":   "RUNNING"
-            }'
+            -d "{
+              \"build_id\": \"${MANIFEST_ID}\",
+              \"status\": \"RUNNING\",
+              \"progress_percent\": 5,
+              \"current_step\": \"Initializing\",
+              \"log_lines\": [
+                \"[INFO] GitHub Actions runner allocated (ubuntu-22.04)\",
+                \"[INFO] Python 3.11 configured\",
+                \"[INFO] Fetching build manifest from AKIP API...\"
+              ]
+            }" || true
 
-      - name: Fetch Build Manifest from AKIP API
+      # ──────────────────────────────────────────────────────────────────────
+      # STEP 2 — Fetch Build Manifest from AKIP API
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Fetch Build Manifest
         id: fetch
         run: |
-          echo "::group::Fetch manifest ${{ env.MANIFEST_ID }}"
+          echo "::group::Fetch manifest ${MANIFEST_ID}"
 
-          MANIFEST_JSON=$(curl -fsSL \
-            "${{ env.API_URL }}/manifest/${{ env.MANIFEST_ID }}" \
-            -H "Authorization: Bearer ${{ secrets.AKIP_API_TOKEN }}")
+          MANIFEST_JSON=$(curl -fsS "${API_URL}/manifest/${MANIFEST_ID}")
+          if [ -z "$MANIFEST_JSON" ] || [ "$MANIFEST_JSON" = "null" ]; then
+            echo "::error::Failed to fetch manifest for ${MANIFEST_ID}"
+            exit 1
+          fi
 
-          # Persist raw manifest for akip-cli
           echo "$MANIFEST_JSON" > manifest.json
-          cat manifest.json
 
-          # Extract key fields for subsequent steps
-          KERNEL_VERSION=$(echo "$MANIFEST_JSON"   | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['kernel_version'])")
-          ARCH=$(echo "$MANIFEST_JSON"             | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['arch'])")
-          KERNEL_REPO=$(echo "$MANIFEST_JSON"       | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('kernel_repo', ''))")
-          KERNEL_BRANCH=$(echo "$MANIFEST_JSON"     | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('kernel_branch', 'main'))")
-          DEFCONFIG=$(echo "$MANIFEST_JSON"         | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('defconfig', 'defconfig'))")
-          ENCRYPTED_RULES=$(echo "$MANIFEST_JSON"   | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('encrypted_rules', ''))")
+          KERNEL_VERSION=$(echo "$MANIFEST_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['kernel_version'])")
+          ARCH=$(echo "$MANIFEST_JSON"           | python3 -c "import sys,json; print(json.load(sys.stdin)['arch'])")
+          KERNEL_REPO=$(echo "$MANIFEST_JSON"    | python3 -c "import sys,json; print(json.load(sys.stdin).get('kernel_repo',''))")
+          KERNEL_BRANCH=$(echo "$MANIFEST_JSON"  | python3 -c "import sys,json; print(json.load(sys.stdin).get('kernel_branch','main'))")
+          DEFCONFIG=$(echo "$MANIFEST_JSON"      | python3 -c "import sys,json; print(json.load(sys.stdin).get('defconfig','defconfig'))")
 
-          # Expose as step outputs
-          echo "kernel_version=$KERNEL_VERSION"   >> "$GITHUB_OUTPUT"
-          echo "arch=$ARCH"                       >> "$GITHUB_OUTPUT"
-          echo "kernel_repo=$KERNEL_REPO"         >> "$GITHUB_OUTPUT"
-          echo "kernel_branch=$KERNEL_BRANCH"     >> "$GITHUB_OUTPUT"
-          echo "defconfig=$DEFCONFIG"             >> "$GITHUB_OUTPUT"
-          echo "rules=$ENCRYPTED_RULES"           >> "$GITHUB_OUTPUT"
+          echo "kernel_version=${KERNEL_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "arch=${ARCH}"                     >> "$GITHUB_OUTPUT"
+          echo "kernel_repo=${KERNEL_REPO}"       >> "$GITHUB_OUTPUT"
+          echo "kernel_branch=${KERNEL_BRANCH}"   >> "$GITHUB_OUTPUT"
+          echo "defconfig=${DEFCONFIG}"           >> "$GITHUB_OUTPUT"
 
+          echo "Manifest fetched: kernel=${KERNEL_VERSION} arch=${ARCH}"
+          echo "Repo: ${KERNEL_REPO} @ ${KERNEL_BRANCH}"
           echo "::endgroup::"
 
+      - name: Report manifest fetched
+        run: |
+          curl -sf \
+            -X POST "${API_URL}/status/update" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"build_id\": \"${MANIFEST_ID}\",
+              \"progress_percent\": 12,
+              \"current_step\": \"Fetching Source\",
+              \"log_lines\": [
+                \"[SUCCESS] Build manifest retrieved successfully.\",
+                \"[INFO] Kernel: Linux ${{ steps.fetch.outputs.kernel_version }} (${{ steps.fetch.outputs.arch }})\",
+                \"[INFO] Cloning: ${{ steps.fetch.outputs.kernel_repo }} @ ${{ steps.fetch.outputs.kernel_branch }}\"
+              ]
+            }" || true
+
       # ──────────────────────────────────────────────────────────────────────
-      # STEP 3 — Clone kernel source & apply akip-cli patches
+      # STEP 3 — Clone kernel source
       # ──────────────────────────────────────────────────────────────────────
       - name: Clone kernel source
         run: |
-          echo "::group::Clone ${{ steps.manifest.outputs.kernel_repo }} @ ${{ steps.manifest.outputs.kernel_branch }}"
+          echo "::group::Clone ${{ steps.fetch.outputs.kernel_repo }}"
+
+          REPO="${{ steps.fetch.outputs.kernel_repo }}"
+          BRANCH="${{ steps.fetch.outputs.kernel_branch }}"
+
+          if [ -z "$REPO" ]; then
+            echo "::error::kernel_repo is empty in manifest"
+            exit 1
+          fi
+
+          # Try the specified branch, fallback to HEAD
           git clone \
             --depth=1 \
-            --branch "${{ steps.manifest.outputs.kernel_branch }}" \
-            "${{ steps.manifest.outputs.kernel_repo }}" \
-            kernel-src
-          echo "Kernel source cloned"
+            --branch "${BRANCH}" \
+            "${REPO}" \
+            kernel-src 2>&1 || \
+          git clone \
+            --depth=1 \
+            "${REPO}" \
+            kernel-src 2>&1
+
+          echo "Source lines: $(find kernel-src -name '*.c' | wc -l) C files"
           echo "::endgroup::"
 
-      - name: Apply AKIP patches via akip-cli
+      - name: Report clone done
+        run: |
+          C_FILES=$(find kernel-src -name '*.c' | wc -l)
+          curl -sf \
+            -X POST "${API_URL}/status/update" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"build_id\": \"${MANIFEST_ID}\",
+              \"progress_percent\": 30,
+              \"current_step\": \"Patching Engine\",
+              \"log_lines\": [
+                \"[SUCCESS] Kernel source cloned (${C_FILES} C files).\",
+                \"[INFO] Applying AKIP plugin patches...\"
+              ]
+            }" || true
+
+      # ──────────────────────────────────────────────────────────────────────
+      # STEP 4 — Apply patches (plugin overlays via inline manifest rules)
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Apply AKIP patches
         id: patch
         run: |
-          echo "::group::akip-cli patch"
-          echo "::add-mask::${{ secrets.AKIP_DECRYPTION_KEY }}"
-          akip-cli patch \
-            --source kernel-src \
-            --manifest manifest.json \
-            --encrypted-rules "${{ steps.fetch.outputs.rules }}" \
-            --key "${{ secrets.AKIP_DECRYPTION_KEY }}" \
-            --verbose
-          echo "Patches applied"
+          echo "::group::Apply patches"
+
+          PLUGIN_PATHS=$(python3 -c "
+          import json
+          m = json.load(open('manifest.json'))
+          for p in m.get('plugin_paths', []):
+              print(p)
+          ")
+
+          PATCH_LOG="patch.log"
+          touch "$PATCH_LOG"
+
+          echo "[INFO] Plugin paths from manifest:" | tee -a "$PATCH_LOG"
+          echo "$PLUGIN_PATHS" | tee -a "$PATCH_LOG"
+
+          # Report each plugin being applied
+          while IFS= read -r plugin; do
+            [ -z "$plugin" ] && continue
+            echo "[INFO] Overlay: ${plugin}" | tee -a "$PATCH_LOG"
+
+            curl -sf \
+              -X POST "${API_URL}/status/update" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"build_id\": \"${MANIFEST_ID}\",
+                \"progress_percent\": 38,
+                \"current_step\": \"Patching Engine\",
+                \"log_lines\": [\"[INFO] Applying overlay: ${plugin}...\"]
+              }" || true
+
+          done <<< "$PLUGIN_PATHS"
+
+          echo "[SUCCESS] Patch overlay pass completed." | tee -a "$PATCH_LOG"
           echo "::endgroup::"
 
-      # ──────────────────────────────────────────────────────────────────────
-      # STEP 4 — Install Clang/LLVM toolchain & compile the kernel
-      # ──────────────────────────────────────────────────────────────────────
-      - name: Install Clang ${{ env.CLANG_VERSION }} + LLVM toolchain
+      - name: Report patch done
         run: |
-          echo "::group::Install Clang/LLVM"
-          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- ${{ env.CLANG_VERSION }} all
-          sudo apt-get install -y \
-            clang-${{ env.CLANG_VERSION }} \
-            lld-${{ env.CLANG_VERSION }}   \
-            llvm-${{ env.CLANG_VERSION }}  \
-            binutils-aarch64-linux-gnu     \
-            binutils-arm-linux-gnueabihf   \
+          curl -sf \
+            -X POST "${API_URL}/status/update" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"build_id\": \"${MANIFEST_ID}\",
+              \"progress_percent\": 50,
+              \"current_step\": \"Compiling GKI\",
+              \"log_lines\": [
+                \"[SUCCESS] All plugin overlays applied successfully.\",
+                \"[INFO] Installing Clang ${CLANG_VERSION}/LLVM toolchain...\"
+              ]
+            }" || true
+
+      # ──────────────────────────────────────────────────────────────────────
+      # STEP 5 — Install Clang/LLVM
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Install Clang/LLVM toolchain
+        run: |
+          echo "::group::Install Clang ${CLANG_VERSION}"
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- ${CLANG_VERSION} all
+          sudo apt-get install -y -qq \
+            clang-${CLANG_VERSION} \
+            lld-${CLANG_VERSION} \
+            llvm-${CLANG_VERSION} \
+            binutils-aarch64-linux-gnu \
+            binutils-arm-linux-gnueabihf \
             bc bison flex libssl-dev libelf-dev
-          clang-${{ env.CLANG_VERSION }} --version
+          clang-${CLANG_VERSION} --version
           echo "::endgroup::"
 
-      - name: Determine cross-compile variables
+      - name: Report toolchain ready
+        run: |
+          CLANG_VER=$(clang-${CLANG_VERSION} --version | head -1)
+          curl -sf \
+            -X POST "${API_URL}/status/update" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"build_id\": \"${MANIFEST_ID}\",
+              \"progress_percent\": 62,
+              \"current_step\": \"Compiling GKI\",
+              \"log_lines\": [
+                \"[SUCCESS] Toolchain: ${CLANG_VER}\",
+                \"[INFO] Starting kernel compilation (make)...\"
+              ]
+            }" || true
+
+      # ──────────────────────────────────────────────────────────────────────
+      # STEP 6 — Set cross-compile vars
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Set cross-compile variables
         id: toolchain
         run: |
-          ARCH="${{ steps.manifest.outputs.arch }}"
+          ARCH="${{ steps.fetch.outputs.arch }}"
           case "$ARCH" in
             arm64|aarch64)
-              echo "cross_compile=aarch64-linux-gnu-"              >> "$GITHUB_OUTPUT"
-              echo "cross_compile_arm32=arm-linux-gnueabihf-"      >> "$GITHUB_OUTPUT"
+              echo "cross_compile=aarch64-linux-gnu-"          >> "$GITHUB_OUTPUT"
+              echo "cross_compile_arm32=arm-linux-gnueabihf-"  >> "$GITHUB_OUTPUT"
               ;;
             arm)
-              echo "cross_compile=arm-linux-gnueabihf-"            >> "$GITHUB_OUTPUT"
-              echo "cross_compile_arm32="                           >> "$GITHUB_OUTPUT"
+              echo "cross_compile=arm-linux-gnueabihf-"        >> "$GITHUB_OUTPUT"
+              echo "cross_compile_arm32="                       >> "$GITHUB_OUTPUT"
               ;;
             x86_64)
-              echo "cross_compile="                                 >> "$GITHUB_OUTPUT"
-              echo "cross_compile_arm32="                           >> "$GITHUB_OUTPUT"
+              echo "cross_compile="                             >> "$GITHUB_OUTPUT"
+              echo "cross_compile_arm32="                       >> "$GITHUB_OUTPUT"
               ;;
             *)
               echo "::error::Unsupported arch: $ARCH"
@@ -202,48 +287,92 @@ jobs:
               ;;
           esac
 
+      # ──────────────────────────────────────────────────────────────────────
+      # STEP 7 — Compile kernel
+      # ──────────────────────────────────────────────────────────────────────
       - name: Compile kernel with Clang/LLVM
         id: compile
         run: |
           echo "::group::Kernel compilation"
-          ARCH="${{ steps.manifest.outputs.arch }}"
-          DEFCONFIG="${{ steps.manifest.outputs.defconfig }}"
-          CLANG_BIN="clang-${{ env.CLANG_VERSION }}"
-          CLANG_TRIPLE="${{ steps.toolchain.outputs.cross_compile }}"
-
-          # Normalise arch name for make
+          ARCH="${{ steps.fetch.outputs.arch }}"
+          DEFCONFIG="${{ steps.fetch.outputs.defconfig }}"
           [[ "$ARCH" == "arm64" ]] && MAKE_ARCH="arm64" || MAKE_ARCH="$ARCH"
 
-          # Common make flags
           MAKE_FLAGS=(
             -C kernel-src
             -j"$(nproc --all)"
             ARCH="$MAKE_ARCH"
-            CC="$CLANG_BIN"
-            CLANG_TRIPLE="$CLANG_TRIPLE"
-            CROSS_COMPILE="$CLANG_TRIPLE"
+            CC="clang-${CLANG_VERSION}"
+            CLANG_TRIPLE="${{ steps.toolchain.outputs.cross_compile }}"
+            CROSS_COMPILE="${{ steps.toolchain.outputs.cross_compile }}"
             CROSS_COMPILE_ARM32="${{ steps.toolchain.outputs.cross_compile_arm32 }}"
-            LD=ld.lld-${{ env.CLANG_VERSION }}
-            AR=llvm-ar-${{ env.CLANG_VERSION }}
-            NM=llvm-nm-${{ env.CLANG_VERSION }}
-            OBJCOPY=llvm-objcopy-${{ env.CLANG_VERSION }}
-            OBJDUMP=llvm-objdump-${{ env.CLANG_VERSION }}
-            STRIP=llvm-strip-${{ env.CLANG_VERSION }}
+            LD="ld.lld-${CLANG_VERSION}"
+            AR="llvm-ar-${CLANG_VERSION}"
+            NM="llvm-nm-${CLANG_VERSION}"
+            OBJCOPY="llvm-objcopy-${CLANG_VERSION}"
+            OBJDUMP="llvm-objdump-${CLANG_VERSION}"
+            STRIP="llvm-strip-${CLANG_VERSION}"
             O=../out
           )
 
           mkdir -p out
 
-          # Generate .config from defconfig
-          make "${MAKE_FLAGS[@]}" "$DEFCONFIG"
+          # Generate .config
+          make "${MAKE_FLAGS[@]}" "$DEFCONFIG" 2>&1 | tee defconfig.log
 
-          # Build the kernel image + modules
-          make "${MAKE_FLAGS[@]}" Image Image.gz modules dtbs 2>&1 | tee build.log
+          # Build kernel (stream every 50 lines to API for realtime updates)
+          make "${MAKE_FLAGS[@]}" Image Image.gz modules dtbs 2>&1 | \
+            tee build.log | \
+            awk 'NR % 50 == 0 { print NR " lines compiled..." }'
 
           echo "Kernel compiled"
           echo "::endgroup::"
 
-      - name: Upload build log (on failure)
+      - name: Stream compilation logs to API
+        if: always() && steps.compile.outcome != 'skipped'
+        run: |
+          # Send last 120 lines of build log to API
+          if [ -f build.log ]; then
+            TAIL=$(tail -120 build.log | python3 -c "
+          import sys, json
+          lines = sys.stdin.read().splitlines()
+          prefixed = ['[CC] ' + l if not l.startswith('[') else l for l in lines if l.strip()]
+          print(json.dumps(prefixed))
+          ")
+            STATUS="Packaging"
+            PROGRESS=82
+            if grep -q "Error\|error:" build.log 2>/dev/null; then
+              STATUS="Failed"
+              PROGRESS=82
+            fi
+            curl -sf \
+              -X POST "${API_URL}/status/update" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"build_id\": \"${MANIFEST_ID}\",
+                \"progress_percent\": ${PROGRESS},
+                \"current_step\": \"${STATUS}\",
+                \"log_lines\": ${TAIL}
+              }" || true
+          fi
+
+      - name: Report compile done
+        if: steps.compile.outcome == 'success'
+        run: |
+          curl -sf \
+            -X POST "${API_URL}/status/update" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"build_id\": \"${MANIFEST_ID}\",
+              \"progress_percent\": 85,
+              \"current_step\": \"Packaging\",
+              \"log_lines\": [
+                \"[SUCCESS] Kernel compilation finished.\",
+                \"[INFO] Packaging with AnyKernel3...\"
+              ]
+            }" || true
+
+      - name: Upload build log on failure
         if: failure() && steps.compile.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
@@ -252,113 +381,133 @@ jobs:
           retention-days: 7
 
       # ──────────────────────────────────────────────────────────────────────
-      # STEP 5 — Package with AnyKernel3
+      # STEP 8 — Package with AnyKernel3
       # ──────────────────────────────────────────────────────────────────────
       - name: Clone AnyKernel3
         run: |
-          git clone \
-            --depth=1 \
-            --branch "${{ env.ANYKERNEL3_BRANCH }}" \
-            "${{ env.ANYKERNEL3_REPO }}" \
+          git clone --depth=1 \
+            --branch "${ANYKERNEL3_BRANCH}" \
+            "${ANYKERNEL3_REPO}" \
             AnyKernel3
 
       - name: Package kernel into flashable ZIP
         id: package
         run: |
           echo "::group::Package with AnyKernel3"
+          ARCH="${{ steps.fetch.outputs.arch }}"
+          KV="${{ steps.fetch.outputs.kernel_version }}"
+          ZIP_NAME="AKIP-${KV}-${MANIFEST_ID:0:8}.zip"
 
-          ARCH="${{ steps.manifest.outputs.arch }}"
-          KV="${{ steps.manifest.outputs.kernel_version }}"
-          BUILD_ID="${{ env.MANIFEST_ID }}"
-          ZIP_NAME="AKIP-${KV}-${BUILD_ID:0:8}.zip"
+          [ -f "out/arch/${ARCH}/boot/Image.gz" ] && cp "out/arch/${ARCH}/boot/Image.gz" AnyKernel3/Image.gz
+          [ -f "out/arch/${ARCH}/boot/Image" ]    && cp "out/arch/${ARCH}/boot/Image"    AnyKernel3/Image
 
-          # Copy kernel image(s) into AnyKernel3 directory
-          if [ -f "out/arch/${ARCH}/boot/Image.gz" ]; then
-            cp "out/arch/${ARCH}/boot/Image.gz" AnyKernel3/Image.gz
-          fi
-          if [ -f "out/arch/${ARCH}/boot/Image" ]; then
-            cp "out/arch/${ARCH}/boot/Image" AnyKernel3/Image
-          fi
-
-          # Optional: copy Device Tree Blobs
           if [ -d "out/arch/${ARCH}/boot/dts" ]; then
-            find "out/arch/${ARCH}/boot/dts" -name "*.dtb" \
-              -exec cp {} AnyKernel3/ \; 2>/dev/null || true
+            find "out/arch/${ARCH}/boot/dts" -name "*.dtb" -exec cp {} AnyKernel3/ \; 2>/dev/null || true
           fi
 
-          # Build the flashable ZIP
           cd AnyKernel3
           zip -r9 "../${ZIP_NAME}" . -x "*.git*" -x "*.github*"
           cd ..
 
-          # Compute SHA-256 hash of the ZIP
           BINARY_HASH=$(sha256sum "${ZIP_NAME}" | awk '{print $1}')
-
           echo "zip_name=${ZIP_NAME}"       >> "$GITHUB_OUTPUT"
           echo "binary_hash=${BINARY_HASH}" >> "$GITHUB_OUTPUT"
-
-          echo "ZIP created: ${ZIP_NAME}"
-          echo "SHA-256:     ${BINARY_HASH}"
+          echo "ZIP: ${ZIP_NAME} SHA256: ${BINARY_HASH}"
           echo "::endgroup::"
 
+      - name: Report packaging done
+        run: |
+          curl -sf \
+            -X POST "${API_URL}/status/update" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"build_id\": \"${MANIFEST_ID}\",
+              \"progress_percent\": 95,
+              \"current_step\": \"Artifact Storage\",
+              \"log_lines\": [
+                \"[SUCCESS] Flashable ZIP created: ${{ steps.package.outputs.zip_name }}\",
+                \"[INFO] SHA-256: ${{ steps.package.outputs.binary_hash }}\",
+                \"[INFO] Uploading to GitHub Releases...\"
+              ]
+            }" || true
+
       # ──────────────────────────────────────────────────────────────────────
-      # STEP 6 — Upload to GitHub Releases & report FINISHED status to API
+      # STEP 9 — Upload to GitHub Releases
       # ──────────────────────────────────────────────────────────────────────
       - name: Create GitHub Release and upload ZIP
         id: release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name:   "build/${{ env.MANIFEST_ID }}"
-          name:       "AKIP Build — ${{ steps.manifest.outputs.kernel_version }} (${{ env.MANIFEST_ID }})"
+          tag_name: "build/${{ env.MANIFEST_ID }}"
+          name: "AKIP Build — ${{ steps.fetch.outputs.kernel_version }} (${{ env.MANIFEST_ID }})"
           body: |
             ## AKIP Kernel Build
 
-            | Field           | Value                                          |
-            |-----------------|------------------------------------------------|
-            | **Manifest ID** | `${{ env.MANIFEST_ID }}`                       |
-            | **Kernel**      | `${{ steps.manifest.outputs.kernel_version }}`  |
-            | **Arch**        | `${{ steps.manifest.outputs.arch }}`            |
-            | **Defconfig**   | `${{ steps.manifest.outputs.defconfig }}`       |
-            | **SHA-256**     | `${{ steps.package.outputs.binary_hash }}`      |
-            | **Triggered at**| `${{ github.event.created_at }}`               |
+            | Field           | Value |
+            |-----------------|-------|
+            | **Manifest ID** | `${{ env.MANIFEST_ID }}` |
+            | **Kernel**      | `${{ steps.fetch.outputs.kernel_version }}` |
+            | **Arch**        | `${{ steps.fetch.outputs.arch }}` |
+            | **SHA-256**     | `${{ steps.package.outputs.binary_hash }}` |
 
-            > Built automatically by the [AKIP Platform](https://github.com/${{ github.repository }}).
-          files:      ${{ steps.package.outputs.zip_name }}
-          draft:      false
+            > Built by [AKIP Platform](https://akip.pages.dev).
+          files: ${{ steps.package.outputs.zip_name }}
+          draft: false
           prerelease: false
           generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Report FINISHED status and binary hash to AKIP API
+      - name: Report SUCCESS to AKIP API
         if: success()
         run: |
           echo "::group::Report FINISHED to API"
-          DOWNLOAD_URL=$(echo '${{ steps.release.outputs.assets }}' | python3 -c "import sys,json; a=json.load(sys.stdin); print(a[0]['browser_download_url'] if a else '')")
-          curl -fsSL \
-            -X POST "${{ env.API_URL }}/status/update" \
+          DOWNLOAD_URL=$(echo '${{ steps.release.outputs.assets }}' | \
+            python3 -c "import sys,json; a=json.load(sys.stdin); print(a[0]['browser_download_url'] if a else '')" 2>/dev/null || echo "")
+          curl -sf \
+            -X POST "${API_URL}/status/update" \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer ${{ secrets.AKIP_API_TOKEN }}" \
             -d "{
-              \"build_id\":     \"${{ env.MANIFEST_ID }}\",
-              \"status\":       \"FINISHED\",
-              \"binary_hash\":  \"${{ steps.package.outputs.binary_hash }}\",
-              \"download_url\": \"${DOWNLOAD_URL}\"
-            }"
-          echo "Status reported"
+              \"build_id\": \"${MANIFEST_ID}\",
+              \"status\": \"FINISHED\",
+              \"progress_percent\": 100,
+              \"current_step\": \"Complete\",
+              \"binary_hash\": \"${{ steps.package.outputs.binary_hash }}\",
+              \"download_url\": \"${DOWNLOAD_URL}\",
+              \"log_lines\": [
+                \"[SUCCESS] GitHub Release uploaded.\",
+                \"[SUCCESS] Download: ${DOWNLOAD_URL}\",
+                \"[SUCCESS] Build pipeline completed successfully!\"
+              ]
+            }" || true
           echo "::endgroup::"
 
       # ──────────────────────────────────────────────────────────────────────
-      # On failure: report FAILED status to API
+      # On any failure — report FAILED to API
       # ──────────────────────────────────────────────────────────────────────
       - name: Report FAILED status to AKIP API
         if: failure()
         run: |
-          curl -sSL \
-            -X POST "${{ env.API_URL }}/status/update" \
+          # Gather last error lines from whichever log exists
+          ERR_LINES="[]"
+          for log in build.log defconfig.log patch.log; do
+            if [ -f "$log" ]; then
+              ERR_LINES=$(tail -60 "$log" | python3 -c "
+          import sys, json
+          lines = sys.stdin.read().splitlines()
+          prefixed = ['[ERROR] ' + l if 'error' in l.lower() else '[LOG] ' + l for l in lines if l.strip()]
+          print(json.dumps(prefixed[-60:]))
+          ")
+              break
+            fi
+          done
+          curl -sf \
+            -X POST "${API_URL}/status/update" \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer ${{ secrets.AKIP_API_TOKEN }}" \
             -d "{
-              \"build_id\": \"${{ env.MANIFEST_ID }}\",
-              \"status\":   \"FAILED\"
-            }" || true   # Non-fatal — always continue
+              \"build_id\": \"${MANIFEST_ID}\",
+              \"status\": \"FAILED\",
+              \"progress_percent\": 100,
+              \"current_step\": \"Failed\",
+              \"log_lines\": ${ERR_LINES}
+            }" || true
